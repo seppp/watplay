@@ -226,3 +226,6 @@ legend { font-weight: 600; padding: 0; margin-bottom: 0.25rem; }
   .item .cover { display: none; }
   .item-actions { grid-column: 1 / -1; justify-content: flex-start; }
 }
+
+.site-foot { max-width: 860px; margin: 0 auto; padding: 0 16px 2rem; text-align: center; font-size: 0.85rem; }
+.site-foot a { color: var(--muted); }

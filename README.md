@@ -91,6 +91,7 @@ This keeps casual visitors out. It is not bank-grade security: anyone who knows 
 
 ```
 index.html          page shell
+privacy.html        privacy notice (German, linked in the footer)
 styles.css          styles (light and dark)
 js/app.js           the app: routing, group view, voting, drag and drop, settings
 js/store.js         storage layer (Firestore, or localStorage in local mode)
