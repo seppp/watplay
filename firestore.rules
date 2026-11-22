@@ -34,6 +34,21 @@ service cloud.firestore {
         && request.resource.data.cats is list
         && request.resource.data.cats.size() <= 50;
       allow delete: if false;
+
+      // Member names linked to a Google account, one document per account.
+      // Only the signed-in owner can write or remove their claim, and the
+      // timestamp is set by the server so the earliest claim on a name wins.
+      match /claims/{uid} {
+        allow get, list: if true;
+        allow create, update: if request.auth != null
+          && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['name', 'at'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 40
+          && request.resource.data.at == request.time;
+        allow delete: if request.auth != null && request.auth.uid == uid;
+      }
     }
   }
 }

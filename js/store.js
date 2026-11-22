@@ -6,6 +6,10 @@
 //   groups/{slug}   public directory entry: { name, protected, createdAt }
 //   spaces/{key}    the group's actual data (lists, sections, votes)
 //
+// spaces/{key}/claims/{uid}  { name, at }: a member name linked to a Google
+//                account. Only that account can write or remove its claim, and
+//                for each name the earliest claim wins.
+//
 // The space key is sha256("watplay:v1:" + slug + ":" + password). Without the
 // password you cannot compute the key, and the security rules forbid listing
 // spaces, so a protected group's data cannot be found or read.
@@ -38,9 +42,73 @@ async function firestoreBackend() {
   const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}`;
   const { initializeApp } = await import(`${base}/firebase-app.js`);
   const fs = await import(`${base}/firebase-firestore.js`);
-  const db = fs.getFirestore(initializeApp(firebaseConfig));
+  const app = initializeApp(firebaseConfig);
+  const db = fs.getFirestore(app);
+
+  // Google sign-in is optional: the auth module loads on first use.
+  let authPromise;
+  const loadAuth = () =>
+    (authPromise ??= import(`${base}/firebase-auth.js`).then((m) => ({ m, auth: m.getAuth(app) })));
+  const listeners = new Set();
+  let user = null;
+  let authStarted = false;
+  const startAuth = () => {
+    if (authStarted) return;
+    authStarted = true;
+    loadAuth()
+      .then(({ m, auth }) =>
+        m.onAuthStateChanged(auth, (u) => {
+          user = u ? { uid: u.uid, email: u.email || "", name: u.displayName || "" } : null;
+          listeners.forEach((cb) => cb(user));
+        })
+      )
+      .catch(() => {});
+  };
 
   return {
+    auth: {
+      available: true,
+      user: () => user,
+      onChange(cb) {
+        listeners.add(cb);
+        startAuth();
+        return () => listeners.delete(cb);
+      },
+      async signIn() {
+        const { m, auth } = await loadAuth();
+        startAuth();
+        try {
+          await m.signInWithPopup(auth, new m.GoogleAuthProvider());
+        } catch (e) {
+          if (e.code === "auth/popup-closed-by-user" || e.code === "auth/cancelled-popup-request") return null;
+          if (e.code === "auth/operation-not-allowed" || e.code === "auth/configuration-not-found")
+            throw new Error("Google sign-in isn't turned on in Firebase yet (see README).");
+          if (e.code === "auth/unauthorized-domain")
+            throw new Error("This website isn't in Firebase's authorized domains yet (see README).");
+          throw e;
+        }
+        const u = auth.currentUser;
+        user = u ? { uid: u.uid, email: u.email || "", name: u.displayName || "" } : null;
+        return user;
+      },
+      async signOut() {
+        const { m, auth } = await loadAuth();
+        await m.signOut(auth);
+      },
+    },
+    subscribeClaims(key, onData) {
+      return fs.onSnapshot(
+        fs.collection(db, "spaces", key, "claims"),
+        (snap) => onData(snap.docs.map((d) => ({ uid: d.id, name: d.data().name, at: d.data().at?.toMillis?.() ?? Date.now() }))),
+        () => onData([])
+      );
+    },
+    async setClaim(key, uid, name) {
+      await fs.setDoc(fs.doc(db, "spaces", key, "claims", uid), { name, at: fs.serverTimestamp() });
+    },
+    async removeClaim(key, uid) {
+      await fs.deleteDoc(fs.doc(db, "spaces", key, "claims", uid));
+    },
     async getGroup(slug) {
       const snap = await fs.getDoc(fs.doc(db, "groups", slug));
       return snap.exists() ? snap.data() : null;
@@ -89,6 +157,11 @@ function localBackend() {
   };
 
   return {
+    auth: { available: false, user: () => null, onChange: () => () => {} },
+    subscribeClaims(key, onData) {
+      queueMicrotask(() => onData([]));
+      return () => {};
+    },
     async getGroup(slug) {
       return read(`groups/${slug}`);
     },
