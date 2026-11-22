@@ -7,6 +7,7 @@ watplay is a small web app for a group of friends to keep a shared "what should 
 ## Features
 
 - **Groups.** Each group has a name, its own members, its own sections and its own list. Open a group by typing its name, or share a link.
+- **Member PINs.** Each member picks a PIN the first time they use their name, so nobody else can vote as them. Each device remembers it. A forgotten PIN can be reset with 🔑 in the group settings.
 - **Optional password.** A group can be password protected when it is created. Without the password its data can't be found or read (see [How the password works](#how-the-password-works)).
 - **Sections** for different kinds of games (Co-op, Strategy, Quick rounds, …), plus an overall **Play next** list that shows everything, and a **Played** list.
 - **Two ways to order:** switch between them in the group settings.
@@ -70,7 +71,9 @@ There is no login. Instead:
 
 Each browser remembers the key after a successful login, so friends type the password once per device. "Forget on this device" in the settings removes it.
 
-This keeps casual visitors out. It is not bank-grade security: anyone who knows the password can read and change everything in that group, and an open group (no password) can be changed by anyone who knows its name. The password is chosen when the group is created and can't be changed later in this version.
+Member PINs work the same way: each member's PIN is stored only as a salted SHA-256 hash in the group's data, and the app asks for it before you can act as that member.
+
+This keeps casual visitors out. It is not bank-grade security: anyone who knows the password can read and change everything in that group, and an open group (no password) can be changed by anyone who knows its name. Likewise, member PINs are checked by the app, not by the server, so a member who edits the data by hand could still get around them. The password is chosen when the group is created and can't be changed later in this version.
 
 ## Project layout
 
