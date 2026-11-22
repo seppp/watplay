@@ -1,4 +1,4 @@
-import { backend, isShared, spaceKey, slugify } from "./store.js";
+import { backend, isShared, spaceKey, slugify, sha256 } from "./store.js";
 import { parseLink, steamCoverFallback, lookupSteamName } from "./links.js";
 
 // ---------- helpers ----------
@@ -8,6 +8,21 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 const app = $("#app");
+
+// Member PINs: stored as { salt, hash } per member name, hash = sha256(salt + ":" + pin).
+// They stop people from casually using someone else's name. Anyone with access to
+// the group can still edit the raw data, so this is not real authentication.
+const MIN_PIN = 4;
+async function makePin(pin) {
+  const salt = uid() + uid();
+  return { salt, hash: await sha256(`${salt}:${pin}`) };
+}
+async function pinMatches(entry, pin) {
+  return !!entry && (await sha256(`${entry.salt}:${pin}`)) === entry.hash;
+}
+function checkPinFormat(pin) {
+  if (String(pin || "").length < MIN_PIN) throw new Error(`Use a PIN of at least ${MIN_PIN} characters.`);
+}
 const dialog = $("#dialog");
 
 let toastTimer;
@@ -145,6 +160,8 @@ function renderHome() {
         <input id="c-name" name="name" required maxlength="60" placeholder="e.g. Friday Night Crew" autocomplete="off" />
         <label for="c-me">Your name</label>
         <input id="c-me" name="me" required maxlength="30" placeholder="e.g. hansl" autocomplete="nickname" />
+        <label for="c-pin">Your PIN (so nobody else can vote as you)</label>
+        <input id="c-pin" name="pin" type="password" required minlength="${MIN_PIN}" maxlength="30" inputmode="numeric" autocomplete="off" placeholder="At least ${MIN_PIN} characters" />
         <label for="c-pass">Password (optional)</label>
         <input id="c-pass" name="password" type="password" autocomplete="new-password" placeholder="Leave empty for an open group" />
         <label for="c-cats">Sections (optional, comma separated)</label>
@@ -176,6 +193,11 @@ function renderHome() {
     const password = f.get("password");
     const slug = slugify(name);
     if (!slug) return (err.textContent = "Use at least one letter or number in the group name.");
+    try {
+      checkPinFormat(f.get("pin"));
+    } catch (ex) {
+      return (err.textContent = ex.message);
+    }
     const btn = $("button.primary", form);
     btn.disabled = true;
     err.textContent = "";
@@ -186,8 +208,10 @@ function renderHome() {
         .map((s) => s.trim())
         .filter(Boolean)
         .slice(0, 30);
-      await be.createGroup(slug, { name, protected: !!password, createdAt: Date.now() }, key, DEFAULT_SPACE(name, me, { cats, mode: f.get("mode") }));
-      saveSession(slug, { key, me, name });
+      const space = DEFAULT_SPACE(name, me, { cats, mode: f.get("mode") });
+      space.pins = { [me]: await makePin(f.get("pin")) };
+      await be.createGroup(slug, { name, protected: !!password, createdAt: Date.now() }, key, space);
+      saveSession(slug, { key, me, pin: space.pins[me].hash, name });
       location.hash = `#/g/${encodeURIComponent(slug)}`;
     } catch (ex) {
       err.textContent = ex.message || "Could not create the group.";
@@ -263,6 +287,7 @@ function attach(slug, meta, key, { fromSaved, fromPassword }) {
 
 function normalize(d) {
   d.members ||= [];
+  d.pins ||= {};
   d.cats ||= [];
   d.items ||= [];
   d.noun ||= "game";
@@ -299,7 +324,15 @@ function renderGroup() {
   renderTabs();
   renderAddForm();
   renderList();
-  if (!cur.me || !d.members.includes(cur.me)) askWhoAmI();
+  if (!isMeVerified()) askWhoAmI();
+}
+
+// You count as that member only if this device proved the member's current PIN.
+function isMeVerified() {
+  const d = cur.data;
+  if (!cur.me || !d.members.includes(cur.me)) return false;
+  const entry = d.pins[cur.me];
+  return !!entry && sessions()[cur.slug]?.pin === entry.hash;
 }
 
 function renderHead() {
@@ -308,7 +341,9 @@ function renderHead() {
     <div>
       <h1>${cur.meta.protected ? "🔒 " : ""}${esc(d.name)}</h1>
       <div class="sub">${d.mode === "vote" ? "Ranked by votes" : "Ordered by drag and drop"} · ${d.members.length} member${d.members.length === 1 ? "" : "s"}${
-        cur.me ? ` · you are <span class="me">${esc(cur.me)}</span> <button class="icon small" data-act="whoami" title="Switch person">switch</button>` : ""
+        isMeVerified()
+          ? ` · you are <span class="me">${esc(cur.me)}</span> <button class="icon small" data-act="whoami" title="Switch person">switch</button>`
+          : ` · <button class="icon small" data-act="whoami">pick your name</button>`
       }</div>
     </div>
     <div class="row">
@@ -422,7 +457,7 @@ function renderList() {
               d.mode === "vote" && !it.played
                 ? `<div class="vote" role="group" aria-label="Your rating">
                     ${[1, 2, 3, 4, 5]
-                      .map((n) => `<button data-act="vote" data-n="${n}" class="${myVote === n ? "on" : ""}" aria-pressed="${myVote === n}" ${cur.me ? "" : "disabled"}>${n}</button>`)
+                      .map((n) => `<button data-act="vote" data-n="${n}" class="${myVote === n ? "on" : ""}" aria-pressed="${myVote === n}" ${isMeVerified() ? "" : "disabled"}>${n}</button>`)
                       .join("")}
                     <span class="score" title="${esc(voteTitle)}">${
                       score.avg === null
@@ -582,7 +617,8 @@ async function onGroupClick(e) {
         }
       );
     case "vote": {
-      if (!item || !cur.me) return;
+      if (!item) return;
+      if (!isMeVerified()) return askWhoAmI(true);
       const n = Number(btn.dataset.n);
       const me = cur.me;
       return change((d) => {
@@ -646,26 +682,61 @@ async function onGroupClick(e) {
 function askWhoAmI(force = false) {
   if (dialog.open && !force) return;
   const d = cur.data;
+  const hint = (name) => {
+    const m = d.members.find((x) => x.toLowerCase() === name.toLowerCase());
+    if (!m) return name ? `“${name}” is new here. Pick a PIN to claim it.` : "";
+    return d.pins[m] ? `Enter ${m}'s PIN.` : `${m} has no PIN yet. Pick one to claim the name.`;
+  };
   openDialog(
     `<form><h2>Who are you?</h2>
-      <p class="muted">Pick your name so your votes and additions are yours. This is remembered on this device.</p>
-      ${d.members.length ? `<div class="member-pick">${d.members.map((m) => `<button value="${esc(m)}" name="pick" formnovalidate>${esc(m)}</button>`).join("")}</div>` : ""}
-      <label for="w-new">${d.members.length ? "Or join as someone new" : "Your name"}</label>
-      <div class="row"><input id="w-new" name="name" maxlength="30" placeholder="Your name" /><button class="primary" value="join">Join</button></div>
+      <p class="muted">Pick your name and enter your PIN, so nobody else can vote as you. This device remembers you.</p>
+      ${d.members.length ? `<div class="member-pick">${d.members.map((m) => `<button type="button" data-pick="${esc(m)}">${d.pins[m] ? "🔒 " : ""}${esc(m)}</button>`).join("")}</div>` : ""}
+      <label for="w-new">Name</label>
+      <input id="w-new" name="name" maxlength="30" placeholder="${d.members.length ? "Your name, or a new one to join" : "Your name"}" value="${esc(d.members.includes(cur.me) ? cur.me : "")}" autocomplete="off" />
+      <label for="w-pin">PIN</label>
+      <input id="w-pin" name="pin" type="password" maxlength="30" inputmode="numeric" autocomplete="off" placeholder="At least ${MIN_PIN} characters" />
+      <p class="muted small" id="w-hint"></p>
       <p class="error"></p>
-      ${force ? `<div class="actions-end"><button value="cancel" formnovalidate>Cancel</button></div>` : ""}
+      <div class="actions-end">${force ? `<button value="cancel" formnovalidate>Cancel</button>` : ""}<button class="primary" value="go">Continue</button></div>
     </form>`,
-    async (f, form, submitter) => {
-      let name = submitter?.name === "pick" ? submitter.value : String(f.get("name") || "").trim();
-      if (!name) throw new Error("Type your name.");
-      const existing = d.members.find((m) => m.toLowerCase() === name.toLowerCase());
-      if (existing) name = existing;
-      else await change((d) => !d.members.includes(name) && d.members.push(name));
+    async (f) => {
+      const typed = String(f.get("name") || "").trim();
+      const pin = String(f.get("pin") || "");
+      if (!typed) throw new Error("Type your name.");
+      const existing = cur.data.members.find((m) => m.toLowerCase() === typed.toLowerCase());
+      const name = existing || typed;
+      let entry = cur.data.pins[name];
+      if (entry) {
+        if (!(await pinMatches(entry, pin))) throw new Error("Wrong PIN.");
+      } else {
+        checkPinFormat(pin);
+        entry = await makePin(pin);
+        let taken = false;
+        await be.mutate(cur.key, (d) => {
+          d.pins ||= {};
+          taken = !!d.pins[name]; // someone may have claimed it a moment ago
+          if (taken) return;
+          d.pins[name] = entry;
+          if (!d.members.includes(name)) d.members.push(name);
+        });
+        if (taken) throw new Error("Someone just claimed that name. Enter its PIN or pick another name.");
+      }
       cur.me = name;
-      saveSession(cur.slug, { me: name });
+      saveSession(cur.slug, { me: name, pin: entry.hash });
       renderGroup();
     }
   );
+  const nameIn = $("#w-new", dialog);
+  const update = () => ($("#w-hint", dialog).textContent = hint(nameIn.value.trim()));
+  nameIn.addEventListener("input", update);
+  for (const b of $$("[data-pick]", dialog))
+    b.addEventListener("click", () => {
+      nameIn.value = b.dataset.pick;
+      update();
+      $("#w-pin", dialog).focus();
+    });
+  update();
+  (nameIn.value ? $("#w-pin", dialog) : nameIn).focus();
 }
 
 function openSettings() {
@@ -683,7 +754,11 @@ function openSettings() {
     `<ul class="edit-list" data-list="${kind}">${items
       .map(
         (v, i) =>
-          `<li><input data-i="${i}" value="${esc(kind === "cats" ? v.name : v)}" maxlength="40" aria-label="${label} ${i + 1}" /><button type="button" class="icon danger" data-rm="${i}" aria-label="Remove">✕</button></li>`
+          `<li><input data-i="${i}" value="${esc(kind === "cats" ? v.name : v)}" maxlength="40" aria-label="${label} ${i + 1}" />${
+            kind === "members" && draft.memberOrigins[i] && d.pins[draft.memberOrigins[i]]
+              ? `<button type="button" class="icon" data-resetpin="${esc(draft.memberOrigins[i])}" title="Reset PIN" aria-label="Reset PIN">🔑</button>`
+              : ""
+          }<button type="button" class="icon danger" data-rm="${i}" aria-label="Remove">✕</button></li>`
       )
       .join("")}</ul>
     <div class="row"><input data-new="${kind}" placeholder="Add ${label.toLowerCase()}" maxlength="40" /><button type="button" data-add="${kind}">Add</button></div>`;
@@ -701,7 +776,7 @@ function openSettings() {
         </fieldset>
         <fieldset><legend>Sections</legend>${editList("cats", draft.cats, "Section")}</fieldset>
         <fieldset><legend>Members</legend>${editList("members", draft.members, "Member")}
-          <p class="muted small">Removing a member hides their votes from the ranking.</p></fieldset>
+          <p class="muted small">Removing a member hides their votes from the ranking. 🔑 resets a forgotten PIN: the next person to pick that name sets a new one.</p></fieldset>
         <p class="muted small">${cur.meta.protected ? "🔒 Password protected. " : "Open group: anyone with the name can open it. "}The password is set when the group is created.</p>
         <p class="error"></p>
         <div class="actions-end">
@@ -737,6 +812,13 @@ function openSettings() {
               if (it.by === o) it.by = n;
             }
           }
+          const pins = {};
+          for (const [i, m] of draft.members.entries()) {
+            const orig = draft.memberOrigins[i];
+            const entry = (orig && d.pins[orig]) || d.pins[m];
+            if (entry) pins[m] = entry;
+          }
+          d.pins = pins;
           d.members = [...draft.members];
           const keep = new Set(draft.cats.map((c) => c.id));
           d.cats = draft.cats.map((c) => ({ id: c.id, name: c.name }));
@@ -773,6 +855,14 @@ function openSettings() {
         }
         draw();
         $(`[data-new="${kind}"]`, dialog)?.focus();
+      } else if (e.target.closest("[data-resetpin]")) {
+        const who = e.target.closest("[data-resetpin]").dataset.resetpin;
+        if (!(await confirmBox(`Reset ${who}'s PIN? The next person to pick “${who}” sets a new one.`, "Reset PIN"))) return openSettings();
+        await change((d) => {
+          if (d.pins) d.pins[who] = null;
+          if (d.pins) d.pins = Object.fromEntries(Object.entries(d.pins).filter(([, v]) => v));
+        });
+        renderGroup();
       } else if (e.target.closest("[data-forget]")) {
         forgetSession(cur.slug);
         dialog.close();
