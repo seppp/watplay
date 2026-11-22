@@ -12,7 +12,7 @@ watplay is a small web app for a group of friends to keep a shared "what should 
 - **Two ways to order:** switch between them in the group settings.
   - **Voting:** every member rates each game 1–5. The highest average goes to the top. Ties go to the game with more votes. The list shows who still has to vote.
   - **Drag and drop:** drag games into order (or use the ↑ ↓ buttons on touch screens).
-- **Add by Steam link or by name.** Pasting a Steam store link fills in the name from the link and shows the cover art. Any other link (or none) works too.
+- **Add by Steam link or by name.** Pasting a Steam store link (even one with only the app ID, like `store.steampowered.com/app/242760/`) looks up the game's name and shows the cover art. Any other link (or none) works too. Names come from [api.steamcmd.net](https://www.steamcmd.net/), a free public mirror of Steam's app info, because Steam's own API can't be called from a web page.
 - **Not just for games.** In settings, change "game / games" to "movie / movies", "book / books" or anything else, and the whole app uses that word.
 - Works on phones, and follows your light or dark system theme.
 

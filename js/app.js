@@ -1,5 +1,5 @@
 import { backend, isShared, spaceKey, slugify } from "./store.js";
-import { parseLink, steamCoverFallback } from "./links.js";
+import { parseLink, steamCoverFallback, lookupSteamName } from "./links.js";
 
 // ---------- helpers ----------
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -283,7 +283,7 @@ function renderGroup() {
       <form class="panel add-form" id="add-form" autocomplete="off">
         <div class="row">
           <input name="link" id="add-link" placeholder="Steam link (optional)" inputmode="url" />
-          <input name="title" id="add-title" required maxlength="120" />
+          <input name="title" id="add-title" maxlength="120" />
           <select name="cat" id="add-cat" aria-label="Section"></select>
           <button class="primary" id="add-btn">Add</button>
         </div>
@@ -475,26 +475,44 @@ function wireShell() {
   let autoTitle = "";
   let parsed = null;
 
-  linkIn.addEventListener("input", () => {
-    parsed = parseLink(linkIn.value);
-    if (parsed?.name && (!titleIn.value || titleIn.value === autoTitle)) {
-      titleIn.value = autoTitle = parsed.name;
-    }
-    if (parsed?.kind === "steam") {
-      preview.hidden = false;
-      preview.innerHTML = `<img src="${esc(parsed.image)}" alt="" referrerpolicy="no-referrer" onerror="this.remove()" /><span>Steam app ${esc(parsed.appId)}${
-        parsed.name ? "" : ". Type the name, the link didn't include it."
-      }</span>`;
-      if (!parsed.name && !titleIn.value) titleIn.focus();
-    } else preview.hidden = true;
+  const showPreview = (p, note) => {
+    preview.hidden = false;
+    preview.innerHTML = `<img src="${esc(p.image)}" alt="" referrerpolicy="no-referrer" onerror="this.remove()" /><span>Steam app ${esc(p.appId)}${note ? ` · ${esc(note)}` : ""}</span>`;
+  };
+
+  // Fill in the name from the link: the URL slug right away, then the exact
+  // Steam name once it's looked up. Never overwrite a name the user typed.
+  const onLink = async () => {
+    const p = parseLink(linkIn.value);
+    if (p?.name && (!titleIn.value.trim() || titleIn.value === autoTitle)) titleIn.value = autoTitle = p.name;
+    if (p?.kind !== "steam") return (preview.hidden = true);
+    showPreview(p, "looking up the name…");
+    const name = await lookupSteamName(p.appId);
+    if (parseLink(linkIn.value)?.appId !== p.appId) return; // link changed meanwhile
+    if (name && (!titleIn.value.trim() || titleIn.value === autoTitle)) titleIn.value = autoTitle = name;
+    showPreview(p, name ? "" : titleIn.value.trim() ? "" : "couldn't find the name, type it");
+    if (!name && !titleIn.value.trim()) titleIn.focus();
+  };
+  linkIn.addEventListener("input", onLink);
+  // Strip spaces around a pasted link so it's stored cleanly.
+  linkIn.addEventListener("change", () => {
+    if (linkIn.value !== linkIn.value.trim()) linkIn.value = linkIn.value.trim();
   });
 
   $("#add-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const title = titleIn.value.trim();
-    if (!title) return titleIn.focus();
+    linkIn.value = linkIn.value.trim();
     const p = parseLink(linkIn.value);
-    if (linkIn.value.trim() && !p) return toast("That link doesn't look right.");
+    if (linkIn.value && !p) return toast("That link doesn't look right.");
+    let title = titleIn.value.trim();
+    if (!title && p?.kind === "steam") {
+      title = (await lookupSteamName(p.appId)) || p.name;
+      if (title) titleIn.value = autoTitle = title;
+    }
+    if (!title) {
+      toast(`Type a ${cur.data.noun} name${p?.kind === "steam" ? ", the Steam name couldn't be found" : ""}.`);
+      return titleIn.focus();
+    }
     const item = {
       id: uid(),
       title,
@@ -597,7 +615,7 @@ async function onGroupClick(e) {
       if (!item) return;
       return openDialog(
         `<form><h2>Edit ${esc(d.noun)}</h2>
-          <label for="e-title">Name</label><input id="e-title" name="title" required maxlength="120" value="${esc(item.title)}" autofocus />
+          <label for="e-title">Name</label><input id="e-title" name="title" maxlength="120" value="${esc(item.title)}" autofocus />
           <label for="e-link">Link</label><input id="e-link" name="link" value="${esc(item.url)}" placeholder="Steam link or any URL" />
           <label for="e-cat">Section</label>
           <select id="e-cat" name="cat"><option value="">No section</option>${d.cats
@@ -606,10 +624,12 @@ async function onGroupClick(e) {
           <p class="error"></p>
           <div class="actions-end"><button value="cancel" formnovalidate>Cancel</button><button class="primary">Save</button></div></form>`,
         async (f) => {
-          const title = f.get("title").trim();
           const linkText = f.get("link").trim();
           const p = parseLink(linkText);
           if (linkText && !p) throw new Error("That link doesn't look right.");
+          let title = f.get("title").trim();
+          if (!title && p?.kind === "steam") title = (await lookupSteamName(p.appId)) || p.name;
+          if (!title) throw new Error("Type a name.");
           await change((d) => {
             const it = d.items.find((x) => x.id === id);
             if (!it) return;
