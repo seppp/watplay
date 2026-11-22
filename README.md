@@ -8,6 +8,7 @@ watplay is a small web app for a group of friends to keep a shared "what should 
 
 - **Groups.** Each group has a name, its own members, its own sections and its own list. Open a group by typing its name, or share a link.
 - **Member PINs.** Each member picks a PIN the first time they use their name, so nobody else can vote as them. Each device remembers it. A forgotten PIN can be reset with 🔑 in the group settings.
+- **Optional Google sign-in.** Instead of a PIN, a member can link their name to a Google account ("link Google" next to your name, or "Continue with Google" when picking a name). Only that account can then use, rename or unlink the name, and this is enforced by the database rules. Needs step 3 below.
 - **Optional password.** A group can be password protected when it is created. Without the password its data can't be found or read (see [How the password works](#how-the-password-works)).
 - **Sections** for different kinds of games (Co-op, Strategy, Quick rounds, …), plus an overall **Play next** list that shows everything, and a **Played** list.
 - **Two ways to order:** switch between them in the group settings.
@@ -38,6 +39,15 @@ At this point the app already works in **local mode**: groups are saved in that 
 5. Firebase shows a `firebaseConfig` block. Copy its values into [`js/config.js`](js/config.js), commit and push.
 
 Reload the site: the badge next to the logo now says **shared** instead of **local mode**.
+
+### 3. Turn on Google sign-in (optional)
+
+Members can always use PINs. To also let them sign in with Google:
+
+1. In the Firebase console, open **Build → Authentication** and click **Get started** if you haven't used it yet.
+2. On the **Sign-in method** tab, click **Google**, switch it to **Enable**, pick a support email, and click **Save**.
+3. On the **Settings** tab, open **Authorized domains**, click **Add domain**, and add your Pages domain, e.g. `seppp.github.io`.
+4. Make sure the Firestore rules are the current [`firestore.rules`](firestore.rules) from this repo (they include the `claims` rules that protect Google-linked names). Re-publish them if you set them up before this feature.
 
 The Firebase web config is meant to be public, so it is fine to commit it. What protects the data are the rules from step 3.
 
@@ -73,7 +83,9 @@ Each browser remembers the key after a successful login, so friends type the pas
 
 Member PINs work the same way: each member's PIN is stored only as a salted SHA-256 hash in the group's data, and the app asks for it before you can act as that member.
 
-This keeps casual visitors out. It is not bank-grade security: anyone who knows the password can read and change everything in that group, and an open group (no password) can be changed by anyone who knows its name. Likewise, member PINs are checked by the app, not by the server, so a member who edits the data by hand could still get around them. The password is chosen when the group is created and can't be changed later in this version.
+Google-linked names are stored as `spaces/{key}/claims/{uid}` documents. The rules only let the signed-in owner of that account write or remove its claim, and stamp it with the server time so the earliest claim on a name wins.
+
+This keeps casual visitors out. It is not bank-grade security: anyone who knows the password can read and change everything in that group, and an open group (no password) can be changed by anyone who knows its name. Likewise, member PINs are checked by the app, not by the server, so a member who edits the data by hand could still get around them. Google sign-in makes a name itself impossible to take over, but votes still live in the shared group data, so someone editing that by hand could still change them. The password is chosen when the group is created and can't be changed later in this version.
 
 ## Project layout
 

@@ -263,14 +263,23 @@ function askPassword(slug, meta, message = "") {
 
 function attach(slug, meta, key, { fromSaved, fromPassword }) {
   const prev = sessions()[slug] || {};
-  cur = { slug, meta, key, data: null, view: "next", me: prev.me || "", shellReady: false };
+  cur = { slug, meta, key, data: null, view: "next", me: prev.me || "", shellReady: false, claims: {}, claimsByUid: {} };
   const mine = cur;
-  cur.unsub = be.subscribe(
+  const rerender = () => cur === mine && cur.data && renderGroup();
+  const unsubClaims = be.subscribeClaims(key, (list) => {
+    if (cur !== mine) return;
+    setClaims(list);
+    rerender();
+  });
+  const unsubAuth = be.auth.onChange(rerender);
+  const unsubData = be.subscribe(
     key,
     (data) => {
       if (cur !== mine) return;
       if (!data) {
-        cur.unsub?.();
+        (cur.unsub || (() => {}))();
+        unsubClaims?.();
+        unsubAuth?.();
         cur = null;
         if (fromSaved) forgetSession(slug);
         if (meta.protected) askPassword(slug, meta, fromPassword ? "Wrong password." : fromSaved ? "Your saved password no longer works." : "");
@@ -283,7 +292,32 @@ function attach(slug, meta, key, { fromSaved, fromPassword }) {
     },
     (err) => toast(err.message || "Lost connection.")
   );
+  cur.unsub = () => {
+    unsubData?.();
+    unsubClaims?.();
+    unsubAuth?.();
+  };
 }
+
+// Google-linked names. For each name the earliest claim wins, so a later claim
+// on someone else's name is ignored.
+function setClaims(list) {
+  const byName = {};
+  const byUid = {};
+  for (const c of [...list].sort((a, b) => a.at - b.at)) {
+    const k = String(c.name || "").toLowerCase();
+    if (!k || byName[k]) continue;
+    byName[k] = c;
+    byUid[c.uid] = c;
+  }
+  cur.claims = byName;
+  cur.claimsByUid = byUid;
+}
+const claimOf = (name) => (name ? cur.claims[name.toLowerCase()] || null : null);
+const myClaim = () => {
+  const u = be.auth.user();
+  return (u && cur.claimsByUid[u.uid]) || null;
+};
 
 function normalize(d) {
   d.members ||= [];
@@ -324,6 +358,13 @@ function renderGroup() {
   renderTabs();
   renderAddForm();
   renderList();
+  const mc = myClaim();
+  if (!isMeVerified() && mc && d.members.includes(mc.name)) {
+    cur.me = mc.name;
+    saveSession(cur.slug, { me: mc.name });
+    renderHead();
+    renderList();
+  }
   if (!isMeVerified()) askWhoAmI();
 }
 
@@ -331,6 +372,8 @@ function renderGroup() {
 function isMeVerified() {
   const d = cur.data;
   if (!cur.me || !d.members.includes(cur.me)) return false;
+  const claim = claimOf(cur.me);
+  if (claim) return be.auth.user()?.uid === claim.uid;
   const entry = d.pins[cur.me];
   return !!entry && sessions()[cur.slug]?.pin === entry.hash;
 }
@@ -342,7 +385,13 @@ function renderHead() {
       <h1>${cur.meta.protected ? "🔒 " : ""}${esc(d.name)}</h1>
       <div class="sub">${d.mode === "vote" ? "Ranked by votes" : "Ordered by drag and drop"} · ${d.members.length} member${d.members.length === 1 ? "" : "s"}${
         isMeVerified()
-          ? ` · you are <span class="me">${esc(cur.me)}</span> <button class="icon small" data-act="whoami" title="Switch person">switch</button>`
+          ? ` · you are <span class="me">${esc(cur.me)}</span>${claimOf(cur.me) ? ` <span class="chip" title="Linked to ${esc(be.auth.user()?.email || "a Google account")}">Google</span>` : ""} <button class="icon small" data-act="whoami" title="Switch person">switch</button> ${
+              be.auth.available
+                ? claimOf(cur.me)
+                  ? `<button class="icon small" data-act="unlink-google" title="Unlink your Google account from this name">unlink</button>`
+                  : `<button class="icon small" data-act="link-google" title="Use Google sign-in for this name instead of a PIN">link Google</button>`
+                : ""
+            }`
           : ` · <button class="icon small" data-act="whoami">pick your name</button>`
       }</div>
     </div>
@@ -604,6 +653,29 @@ async function onGroupClick(e) {
       return openSettings();
     case "whoami":
       return askWhoAmI(true);
+    case "link-google":
+      try {
+        const u = be.auth.user() || (await be.auth.signIn());
+        if (!u) return;
+        const other = myClaim();
+        if (other && other.name !== cur.me) return toast(`That Google account is already linked to “${other.name}” here.`);
+        await be.setClaim(cur.key, u.uid, cur.me);
+        toast(`“${cur.me}” is now linked to ${u.email || "your Google account"}.`);
+      } catch (e) {
+        toast(e.message);
+      }
+      return;
+    case "unlink-google": {
+      const c = claimOf(cur.me);
+      if (!c || !(await confirmBox(`Unlink Google from “${cur.me}”? The name will be protected by its PIN again${d.pins[cur.me] ? "" : " (you'll set one now)"}.`, "Unlink"))) return;
+      try {
+        await be.removeClaim(cur.key, c.uid);
+        if (d.pins[cur.me]) saveSession(cur.slug, { pin: "" });
+      } catch (e) {
+        toast(e.message);
+      }
+      return;
+    }
     case "add-cat":
       return openDialog(
         `<form><h2>New section</h2><label for="nc">Name</label><input id="nc" name="name" required maxlength="40" autofocus placeholder="e.g. Co-op" />
@@ -684,27 +756,39 @@ function askWhoAmI(force = false) {
   const d = cur.data;
   const hint = (name) => {
     const m = d.members.find((x) => x.toLowerCase() === name.toLowerCase());
-    if (!m) return name ? `“${name}” is new here. Pick a PIN to claim it.` : "";
+    if (!m) return name ? `“${name}” is new here. Pick a PIN${be.auth.available ? " or use Google" : ""} to claim it.` : "";
+    if (claimOf(m)) return `${m} signs in with Google. Use the Google button.`;
     return d.pins[m] ? `Enter ${m}'s PIN.` : `${m} has no PIN yet. Pick one to claim the name.`;
   };
   openDialog(
     `<form><h2>Who are you?</h2>
       <p class="muted">Pick your name and enter your PIN, so nobody else can vote as you. This device remembers you.</p>
-      ${d.members.length ? `<div class="member-pick">${d.members.map((m) => `<button type="button" data-pick="${esc(m)}">${d.pins[m] ? "🔒 " : ""}${esc(m)}</button>`).join("")}</div>` : ""}
+      ${d.members.length ? `<div class="member-pick">${d.members.map((m) => `<button type="button" data-pick="${esc(m)}">${claimOf(m) ? "G " : d.pins[m] ? "🔒 " : ""}${esc(m)}</button>`).join("")}</div>` : ""}
       <label for="w-new">Name</label>
       <input id="w-new" name="name" maxlength="30" placeholder="${d.members.length ? "Your name, or a new one to join" : "Your name"}" value="${esc(d.members.includes(cur.me) ? cur.me : "")}" autocomplete="off" />
       <label for="w-pin">PIN</label>
       <input id="w-pin" name="pin" type="password" maxlength="30" inputmode="numeric" autocomplete="off" placeholder="At least ${MIN_PIN} characters" />
       <p class="muted small" id="w-hint"></p>
       <p class="error"></p>
-      <div class="actions-end">${force ? `<button value="cancel" formnovalidate>Cancel</button>` : ""}<button class="primary" value="go">Continue</button></div>
+      <div class="actions-end">${force ? `<button value="cancel" formnovalidate>Cancel</button>` : ""}${
+        be.auth.available ? `<button value="google" formnovalidate>Continue with Google</button>` : ""
+      }<button class="primary" value="go">Continue</button></div>
+      ${be.auth.user() ? `<p class="muted small">Signed in with Google as ${esc(be.auth.user().email)} · <a href="#" data-signout>sign out</a></p>` : ""}
     </form>`,
-    async (f) => {
+    async (f, form, submitter) => {
       const typed = String(f.get("name") || "").trim();
       const pin = String(f.get("pin") || "");
+      if (submitter?.value === "google") return continueWithGoogle(typed, pin);
       if (!typed) throw new Error("Type your name.");
       const existing = cur.data.members.find((m) => m.toLowerCase() === typed.toLowerCase());
       const name = existing || typed;
+      const claim = claimOf(name);
+      if (claim) {
+        if (be.auth.user()?.uid !== claim.uid) throw new Error(`${name} signs in with Google. Use “Continue with Google”.`);
+        cur.me = name;
+        saveSession(cur.slug, { me: name });
+        return renderGroup();
+      }
       let entry = cur.data.pins[name];
       if (entry) {
         if (!(await pinMatches(entry, pin))) throw new Error("Wrong PIN.");
@@ -729,6 +813,11 @@ function askWhoAmI(force = false) {
   const nameIn = $("#w-new", dialog);
   const update = () => ($("#w-hint", dialog).textContent = hint(nameIn.value.trim()));
   nameIn.addEventListener("input", update);
+  $("[data-signout]", dialog)?.addEventListener("click", async (e) => {
+    e.preventDefault();
+    await be.auth.signOut();
+    askWhoAmI(force);
+  });
   for (const b of $$("[data-pick]", dialog))
     b.addEventListener("click", () => {
       nameIn.value = b.dataset.pick;
@@ -737,6 +826,29 @@ function askWhoAmI(force = false) {
     });
   update();
   (nameIn.value ? $("#w-pin", dialog) : nameIn).focus();
+}
+
+// Sign in with Google and use (or link) a member name.
+async function continueWithGoogle(typed, pin) {
+  const u = be.auth.user() || (await be.auth.signIn());
+  if (!u) return true; // popup closed: keep the dialog open
+  const mine = myClaim();
+  let name;
+  if (mine) {
+    name = mine.name;
+  } else {
+    if (!typed) throw new Error("Type the name to link to your Google account.");
+    name = cur.data.members.find((m) => m.toLowerCase() === typed.toLowerCase()) || typed;
+    const claim = claimOf(name);
+    if (claim && claim.uid !== u.uid) throw new Error(`${name} is linked to a different Google account.`);
+    const entry = cur.data.pins[name];
+    if (entry && !(await pinMatches(entry, pin))) throw new Error(`Enter ${name}'s PIN once to link it to Google.`);
+    await be.setClaim(cur.key, u.uid, name);
+  }
+  if (!cur.data.members.includes(name)) await change((d) => !d.members.includes(name) && d.members.push(name));
+  cur.me = name;
+  saveSession(cur.slug, { me: name });
+  renderGroup();
 }
 
 function openSettings() {
@@ -750,15 +862,24 @@ function openSettings() {
     cats: d.cats.map((c) => ({ ...c })),
   };
 
+  // Someone else's Google-linked name can't be renamed or removed here.
+  const lockedMember = (orig) => {
+    const c = orig && claimOf(orig);
+    return !!c && c.uid !== be.auth.user()?.uid;
+  };
   const editList = (kind, items, label) =>
     `<ul class="edit-list" data-list="${kind}">${items
       .map(
         (v, i) =>
-          `<li><input data-i="${i}" value="${esc(kind === "cats" ? v.name : v)}" maxlength="40" aria-label="${label} ${i + 1}" />${
-            kind === "members" && draft.memberOrigins[i] && d.pins[draft.memberOrigins[i]]
+          `<li><input data-i="${i}" value="${esc(kind === "cats" ? v.name : v)}" maxlength="40" aria-label="${label} ${i + 1}" ${
+            kind === "members" && lockedMember(draft.memberOrigins[i]) ? `disabled title="Linked to Google: only they can change it"` : ""
+          }/>${
+            kind === "members" && lockedMember(draft.memberOrigins[i])
+              ? `<span class="chip" title="Linked to Google">G</span>`
+              : kind === "members" && draft.memberOrigins[i] && d.pins[draft.memberOrigins[i]] && !claimOf(draft.memberOrigins[i])
               ? `<button type="button" class="icon" data-resetpin="${esc(draft.memberOrigins[i])}" title="Reset PIN" aria-label="Reset PIN">🔑</button>`
               : ""
-          }<button type="button" class="icon danger" data-rm="${i}" aria-label="Remove">✕</button></li>`
+          }${kind === "members" && lockedMember(draft.memberOrigins[i]) ? "" : `<button type="button" class="icon danger" data-rm="${i}" aria-label="Remove">✕</button>`}</li>`
       )
       .join("")}</ul>
     <div class="row"><input data-new="${kind}" placeholder="Add ${label.toLowerCase()}" maxlength="40" /><button type="button" data-add="${kind}">Add</button></div>`;
@@ -824,6 +945,8 @@ function openSettings() {
           d.cats = draft.cats.map((c) => ({ id: c.id, name: c.name }));
           for (const it of d.items) if (it.cat && !keep.has(it.cat)) it.cat = null;
         });
+        const mc = myClaim();
+        if (mc && draft.renamed[mc.name]) await be.setClaim(cur.key, mc.uid, draft.renamed[mc.name]).catch((e) => toast(e.message));
         if (draft.renamed[cur.me]) {
           cur.me = draft.renamed[cur.me];
           saveSession(cur.slug, { me: cur.me });
